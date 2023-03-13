@@ -26,6 +26,7 @@
 #include <__memory/auto_ptr.h>
 #include <__memory/compressed_pair.h>
 #include <__memory/construct_at.h>
+#include <__memory/make_contiguous_objects.h>
 #include <__memory/pointer_traits.h>
 #include <__memory/uninitialized_algorithms.h>
 #include <__memory/unique_ptr.h>
@@ -1053,53 +1054,20 @@ template <class _Tp, class _Alloc>
 struct __unbounded_array_control_block<_Tp[], _Alloc> : __shared_weak_count
 {
     _LIBCPP_HIDE_FROM_ABI constexpr
-    _Tp* __get_data() noexcept { return __data_; }
-
-    _LIBCPP_HIDE_FROM_ABI
-    explicit __unbounded_array_control_block(_Alloc const& __alloc, size_t __count, _Tp const& __arg)
-        : __alloc_(__alloc), __count_(__count)
+    _Tp* __get_data() noexcept
     {
-        std::__uninitialized_allocator_fill_n_multidimensional(__alloc_, std::begin(__data_), __count_, __arg);
+        return xtd::get_adjacent_address<_Tp>(this+1);
     }
 
     _LIBCPP_HIDE_FROM_ABI
     explicit __unbounded_array_control_block(_Alloc const& __alloc, size_t __count)
         : __alloc_(__alloc), __count_(__count)
     {
-#if _LIBCPP_STD_VER >= 20
-        if constexpr (is_same_v<typename _Alloc::value_type, __for_overwrite_tag>) {
-            // We are purposefully not using an allocator-aware default construction because the spec says so.
-            // There's currently no way of expressing default initialization in an allocator-aware manner anyway.
-            std::uninitialized_default_construct_n(std::begin(__data_), __count_);
-        } else {
-            std::__uninitialized_allocator_value_construct_n_multidimensional(__alloc_, std::begin(__data_), __count_);
-        }
-#else
-        std::__uninitialized_allocator_value_construct_n_multidimensional(__alloc_, std::begin(__data_), __count_);
-#endif
     }
-
-    // Returns the number of bytes required to store a control block followed by the given number
-    // of elements of _Tp, with the whole storage being aligned to a multiple of _Tp's alignment.
-    _LIBCPP_HIDE_FROM_ABI
-    static constexpr size_t __bytes_for(size_t __elements) {
-        // When there's 0 elements, the control block alone is enough since it holds one element.
-        // Otherwise, we allocate one fewer element than requested because the control block already
-        // holds one. Also, we use the bitwise formula below to ensure that we allocate enough bytes
-        // for the whole allocation to be a multiple of _Tp's alignment. That formula is taken from [1].
-        //
-        // [1]: https://en.wikipedia.org/wiki/Data_structure_alignment#Computing_padding
-        size_t __bytes = __elements == 0 ? sizeof(__unbounded_array_control_block)
-                                         : (__elements - 1) * sizeof(_Tp) + sizeof(__unbounded_array_control_block);
-        constexpr size_t __align = alignof(_Tp);
-        return (__bytes + __align - 1) & ~(__align - 1);
-    }
-
-    _LIBCPP_HIDE_FROM_ABI_VIRTUAL
-    ~__unbounded_array_control_block() override { } // can't be `= default` because of the sometimes-non-trivial union member __data_
 
 private:
     void __on_zero_shared() _NOEXCEPT override {
+        auto __data_ = __get_data();
 #if _LIBCPP_STD_VER >= 20
         if constexpr (is_same_v<typename _Alloc::value_type, __for_overwrite_tag>) {
             std::__reverse_destroy(__data_, __data_ + __count_);
@@ -1114,22 +1082,21 @@ private:
     }
 
     void __on_zero_shared_weak() _NOEXCEPT override {
-        using _AlignedStorage = __sp_aligned_storage<alignof(__unbounded_array_control_block)>;
-        using _StorageAlloc = __allocator_traits_rebind_t<_Alloc, _AlignedStorage>;
-        using _PointerTraits = pointer_traits<typename allocator_traits<_StorageAlloc>::pointer>;
+        // The data array has already been destroyed, create a fake type to prevent
+        // xtd::destroy_contigous_objects from destroying them again
+        using _TpStorage = __sp_aligned_storage<alignof(_Tp)>;
+        auto __data_stg = reinterpret_cast<_TpStorage*>(__get_data());
 
-        _StorageAlloc __tmp(__alloc_);
-        __alloc_.~_Alloc();
-        size_t __size = __unbounded_array_control_block::__bytes_for(__count_);
-        _AlignedStorage* __storage = reinterpret_cast<_AlignedStorage*>(this);
-        allocator_traits<_StorageAlloc>::deallocate(__tmp, _PointerTraits::pointer_to(*__storage), __size);
+        auto layout =
+            std::make_tuple(xtd::span{this, this+1}, xtd::span{__data_stg, __data_stg + __count_});
+
+        auto alloc = __alloc_;
+
+        xtd::destroy_contiguous_objects(alloc, layout);
     }
 
     _LIBCPP_NO_UNIQUE_ADDRESS _Alloc __alloc_;
     size_t __count_;
-    union {
-        _Tp __data_[1];
-    };
 };
 
 template<class _Array, class _Alloc, class... _Arg>
@@ -1137,18 +1104,27 @@ _LIBCPP_HIDE_FROM_ABI
 shared_ptr<_Array> __allocate_shared_unbounded_array(const _Alloc& __a, size_t __n, _Arg&& ...__arg)
 {
     static_assert(__libcpp_is_unbounded_array<_Array>::value);
-    // We compute the number of bytes necessary to hold the control block and the
-    // array elements. Then, we allocate an array of properly-aligned dummy structs
-    // large enough to hold the control block and array. This allows shifting the
-    // burden of aligning memory properly from us to the allocator.
     using _ControlBlock = __unbounded_array_control_block<_Array, _Alloc>;
-    using _AlignedStorage = __sp_aligned_storage<alignof(_ControlBlock)>;
-    using _StorageAlloc = __allocator_traits_rebind_t<_Alloc, _AlignedStorage>;
-    __allocation_guard<_StorageAlloc> __guard(__a, _ControlBlock::__bytes_for(__n) / sizeof(_AlignedStorage));
-    _ControlBlock* __control_block = reinterpret_cast<_ControlBlock*>(std::addressof(*__guard.__get()));
-    std::__construct_at(__control_block, __a, __n, std::forward<_Arg>(__arg)...);
-    __guard.__release_ptr();
-    return shared_ptr<_Array>::__create_with_control_block(__control_block->__get_data(), __control_block);
+    using _Tp = remove_extent_t<_Array>;
+
+    constexpr bool __for_overwrite = is_same_v<typename _Alloc::value_type, __for_overwrite_tag>;
+#if _LIBCPP_STD_VER >= 20
+    // We are purposefully not using an allocator-aware default construction because the spec says so.
+    // There's currently no way of expressing default initialization in an allocator-aware manner anyway.
+    using _ValueInit = std::conditional_t<__for_overwrite, xtd::default_ctor_t, xtd::value_ctor_t>;
+#else
+    using _ValueInit = xtd::value_ctor_t;
+#endif
+
+    using array_ctor = std::conditional_t<sizeof...(__arg) != 0, xtd::fill_ctor_t, _ValueInit>;
+
+    auto [__control_block, __data] = xtd::make_contiguous_objects<_Alloc, _ControlBlock, _Tp>(__a,
+            xtd::arg(xtd::ctor, 1, __a, __n),
+            xtd::arg(array_ctor{}, __n, std::forward<_Arg>(__arg)...)
+    );
+    assert(__control_block[0].__get_data() == __data.begin());
+
+    return shared_ptr<_Array>::__create_with_control_block(__control_block[0].__get_data(), __control_block.begin());
 }
 
 template <class _Tp, class _Alloc>

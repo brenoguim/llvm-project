@@ -450,6 +450,7 @@ set(files
   __memory/concepts.h
   __memory/construct_at.h
   __memory/destruct_n.h
+  __memory/make_contiguous_objects.h
   __memory/pointer_traits.h
   __memory/ranges_construct_at.h
   __memory/ranges_uninitialized_algorithms.h
